@@ -42,26 +42,20 @@ class fsevent_sync(object):
         self.sync_job_lock   = threading.Lock()
         self.dispatcher_lock = threading.Semaphore(0)
         
-        ''' objc values'''
-        self._observer_pool = None
-        self._fsevent_runner = None
+        # objc values
+        self._oberver_runloop_ref = None
         
+        # Start running
         self.sync_status = CONST.STATUS_IDLE
         
         self.init_job_thread()
+        
         
     def init_job_thread(self):
         t = threading.Thread(target=self.job_dispatcher)
         t.daemon = True
         t.start()
         #self.job_thread = t
-        
-    def init_fsevent_observer(self):
-        
-        t = threading.Thread(target=self.start_observing_source)
-        t.daemon = True
-        t.start()
-        
     
     def job_dispatcher(self):
         while True:
@@ -116,17 +110,18 @@ class fsevent_sync(object):
         # if remote check for form
         return True
     
-    
     def start_sync(self):
         """Create a fsevent observer and start watching the source"""
-        #self.validate_source(source)
-        #self.validate_destination(destination)
+        #@todo: self.validate_source(source)
+        #@todo: self.validate_destination(destination)
         
         if self.sync_source == None:
             logger.debug('Could not start sync, sync_source eq None')
             return False
+        
         #self.start_observing_source()
         self.init_fsevent_observer()
+        
         self.sync_stats = CONST.STATUS_ACTIVE
     
     def pause_sync(self):
@@ -134,8 +129,12 @@ class fsevent_sync(object):
         # requeue current rsync command
         # preserve fs events
         # preserve jobs
+        logger.debug('pausing')
+        
         self.stop_observing_source()
         self.sync_status = CONST.STATUS_IDLE
+        logger.debug('paused')
+        
         
     def stop_sync(self):
         # kill rsync command? In separate process?
@@ -144,22 +143,33 @@ class fsevent_sync(object):
         self.stop_observing_source()
         self.sync_status = CONST.STATUS_IDLE
         
-    def fsevents_callback(self, streamRef, clientInfo, numEvents, eventPaths, eventMasks, eventIDs):
-        logger.debug('fsevet_callback')
-    
     def start_observing_source(self):
+        t = threading.Thread(target=self.init_fsevent_observer)
+        t.daemon = True
+        t.start()
+    
+    def stop_observing_source(self):
+        
+        logger.debug('Stop observing')
+        
+        if not self._oberver_runloop_ref == None:
+            CFRunLoopStop(self._oberver_runloop_ref)
+            logger.debug('CFRunLoop stopped')
+            
+        logger.debug('CFRunLoop')
+    
+    def fsevents_callback(streamRef, clientInfo, numEvents, eventPaths, eventMasks, eventIDs):
+        logger.log("fsevents_callback")
+    
+    def init_fsevent_observer(self):
+        ''' Instantiate and run an FSEventStream in a CFRunLoop. 
+        
+        Intended to be used in a separate thread to asynchronously report 
+        fsevents using the self.process_fs_event callback
         
         '''
-        # Start watching the directory
-        self.fs_observer = Observer()
-        self.fs_stream   = Stream(self.process_fs_event, str(self.sync_source), 
-                                file_events=False)
-        self.fs_observer.schedule(self.fs_stream)
-        self.fs_observer.start()
-        # @todo: what happens if the source directory is deleted?, need to detect and shut down
-        '''
         
-
+        pool = NSAutoreleasePool.alloc().init()
         
         '''
         FSEventStreamCreate
@@ -173,17 +183,12 @@ class fsevent_sync(object):
            FSEventStreamCreateFlags flags);
         '''
         
-        #pool = NSAutoreleasePool.alloc().init()
-        self._observer_pool = NSAutoreleasePool.alloc().init()
-        self._fsevent_runner = CFRunLoopRun
-        
-        print 'start'
-        since = -1
+        since   = -1
         latency = 1.0
-        flags = 0
+        flags   = 0
         
         fsevent_stream = FSEventStreamCreate(kCFAllocatorDefault, 
-                                              self.fsevents_callback,
+                                              self.process_fs_event,
                                               self.sync_source,
                                               [self.sync_source],
                                               since,
@@ -194,40 +199,33 @@ class fsevent_sync(object):
                                          CFRunLoopGetCurrent(), 
                                          kCFRunLoopDefaultMode)
         
-        startedOK = FSEventStreamStart(fsevent_stream)
-        if not startedOK:
+        stream_started = FSEventStreamStart(fsevent_stream)
+        if not stream_started:
             logger.error( "Failed to start the FSEventStream")
             return
         
-        print 'pre loop'
-        #CFRunLoopRun()
+        # keep a reference to the loop so it can be stopped e.g. pause, stop
+        self._oberver_runloop_ref = CFRunLoopGetCurrent()
+        
         try:
-            self._fsevent_runner()
+            logger.debug("Start EVENT LOOP")
+            CFRunLoopRun()
+            logger.debug("EVENT LOOP Stopped")
         finally:
+            # Clean up stream and event loop
+            logger.debug("EVENT LOOP finally")
             FSEventStreamStop(fsevent_stream)
             FSEventStreamInvalidate(fsevent_stream)
-        
-        print 'post loop'
-            
-         #Stop / Invalidate / Release
-
-        
-        #del pool
-        
+            del pool
+    
+    def process_fs_event(self, streamRef, clientInfo, numEvents, eventPaths, eventMasks, eventIDs):
+        logger.debug("Process fs event - \n\
+        clientInfo: %s, \n\
+        numEvents: %s, \n\
+        eventPaths: %s, \n\
+        eventMasks: %s, \n\
+        eventIDs: %s\n", clientInfo, numEvents, eventPaths, eventMasks, eventIDs)
         return
-    
-    def stop_observing_source(self):
-        '''
-        if self.fs_observer:
-            self.fs_observer.unschedule(self.fs_stream)
-            self.fs_observer.stop()
-            self.fs_observer.join()
-        '''
-        del self._observer_pool
-        CFRunLoopStop(self._fsevent_runner)
-        
-    
-    def process_fs_event(self, path, mask):
         events = []
         #gc.collect()
         
