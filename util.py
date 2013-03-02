@@ -1,23 +1,25 @@
 __version__ = "1.0"
 
 from FSEvents import *
+from Queue import Queue
+from fsevents import Observer, Stream
+from time import sleep
+import config as CONFIG
+import constant as CONST
+import gc
+import hashlib
+import logging
 import objc
 import os
-import sys
-import threading
-#import signal
-import logging
-import hashlib
-from Queue import Queue
-from fsevents import Observer
-from fsevents import Stream
-from time import sleep
-import gc
-
-import constant as CONST
-import config as CONFIG
-
 import pprint
+import sys
+import string
+import threading
+from tempfile import NamedTemporaryFile 
+from subprocess import call
+#import signal
+
+
 
 logging.basicConfig(format=CONST.LOG_FORMAT)
 
@@ -38,9 +40,9 @@ class fsevent_sync(object):
         
         self.job_thread = None
         
-        self.sync_queue      = Queue(100000)
         self.sync_job_lock   = threading.Lock()
-        self.dispatcher_lock = threading.Semaphore(0)
+        self.dispatcher_lock = threading.Condition()
+        self.event_path_list = []
         
         # objc values
         self._oberver_runloop_ref = None
@@ -55,26 +57,53 @@ class fsevent_sync(object):
         t = threading.Thread(target=self.job_dispatcher)
         t.daemon = True
         t.start()
-        #self.job_thread = t
+        self.job_thread = t
     
     def job_dispatcher(self):
+        ''' Waits for signalling from Process the '''
+        sync_queue = Queue()
+        
         while True:
-            logger.debug('Job disptcher run')
             
-            #if self.sync_queue.qsize() % 10 or self.sync_queue.qsize() == 0:
-                #gc.collect()
-            logger.debug("qsize %s", self.sync_queue.qsize())
+            #in each dispatcher iteration 
             self.dispatcher_lock.acquire()
-            #if self.sync_queue.qsize() > 0:
-            try:
-                self.sync_job_lock.acquire()
-                runner = job_runner(self.sync_queue)
-                runner.run()
-            finally:
-                self.sync_job_lock.release()
-                #t = threading.Thread(target=runner.run)
-                #t.daemon = True
-                #t.start()
+            
+            if not len(self.event_path_list):
+                # wait for fsevent(s) to come in
+                gc.collect() # maybe not necessary
+                self.dispatcher_lock.wait()
+            
+            # create and queue a job for the current list of paths
+            job = self.create_job(self.event_path_list)
+                
+            if job:
+                sync_queue.put(job)
+            else:
+                logger.debug("Job was not added to queue %s", job)
+            
+            del job
+            
+            # clear list after processing
+            self.event_path_list = []
+            
+            # release lock to allow fsevents to add to self.event_path_list
+            self.dispatcher_lock.release()
+            
+            # execute all jobs currently in the sync_queue
+            # rsync jobs could compete, run one at a time
+            while sync_queue.qsize() > 0:
+                try:
+                    runner = job_runner(sync_queue.get())
+                    t = threading.Thread(target=runner.run)
+                    t.daemon = True
+                    t.start()
+                    t.join()
+                    del t
+                except Exception as e:
+                    logger.debug('sync job threw exception')
+                    logger.debug(e)
+                finally:
+                    sync_queue.task_done()
     
     def set_sync_source(self, source):
         path = os.path.abspath(source)
@@ -119,8 +148,7 @@ class fsevent_sync(object):
             logger.debug('Could not start sync, sync_source eq None')
             return False
         
-        #self.start_observing_source()
-        self.init_fsevent_observer()
+        self.start_observing_source()
         
         self.sync_stats = CONST.STATUS_ACTIVE
     
@@ -158,9 +186,6 @@ class fsevent_sync(object):
             
         logger.debug('CFRunLoop')
     
-    def fsevents_callback(streamRef, clientInfo, numEvents, eventPaths, eventMasks, eventIDs):
-        logger.log("fsevents_callback")
-    
     def init_fsevent_observer(self):
         ''' Instantiate and run an FSEventStream in a CFRunLoop. 
         
@@ -184,11 +209,11 @@ class fsevent_sync(object):
         '''
         
         since   = -1
-        latency = 1.0
+        latency = 4.0
         flags   = 0
         
         fsevent_stream = FSEventStreamCreate(kCFAllocatorDefault, 
-                                              self.process_fs_event,
+                                              self.process_fsevent,
                                               self.sync_source,
                                               [self.sync_source],
                                               since,
@@ -218,45 +243,43 @@ class fsevent_sync(object):
             FSEventStreamInvalidate(fsevent_stream)
             del pool
     
-    def process_fs_event(self, streamRef, clientInfo, numEvents, eventPaths, eventMasks, eventIDs):
+    def process_fsevent(self, stream_ref, client_info, event_count, event_paths, 
+                        event_masks, event_ids):
         logger.debug("Process fs event - \n\
-        clientInfo: %s, \n\
-        numEvents: %s, \n\
-        eventPaths: %s, \n\
-        eventMasks: %s, \n\
-        eventIDs: %s\n", clientInfo, numEvents, eventPaths, eventMasks, eventIDs)
-        return
-        events = []
-        #gc.collect()
+        client_info: %s, \n\
+        event_count: %s, \n\
+        event_paths: %s, \n\
+        event_masks: %s, \n\
+        event_ids: %s\n", client_info, event_count, event_paths, event_masks, 
+        event_ids)
         
-        for key, value in CONST.FS_EVENT_FLAG.iteritems():
-            if mask & key:
-                events.append(value)
+        # lock access to the event list
+        self.dispatcher_lock.acquire()
         
-        logger.debug("fsevent - File: %s, Event(s): %s",
-                     path, ', '.join(events))
-        logger.debug(os.path.abspath(path))
+        # add the new event paths to the list
+        for i in range(event_count):
+            self.event_path_list.append(event_paths[i])
         
-        job = self.create_job(path)
-
-        if job:
-            self.sync_queue.put(job)
-            self.dispatcher_lock.release()
-            logger.debug("Job was added to queue")
-            logger.debug("Q size %i", self.sync_queue.qsize())
-            logger.debug(job.source)
-        else:
-            logger.debug("Job was not added to queue %s", job)
-            
-        
+        # increase the dispatcher semaphore, starts event path processing and 
+        #    job creation
+        logger.debug("fsevent notify dispatcher")
+        self.dispatcher_lock.notify()
+        logger.debug("fsevent release dispatcher")
+        self.dispatcher_lock.release()
         
     
-    def create_job(self, event_path):
+    def create_job(self, job_paths):
         
-        source = event_path
-        destination = ''
+        abs_job_paths = []
         
-        job = sync_job(source, destination)
+        # process soruces
+        for p in job_paths:
+            abs_job_paths.append(os.path.abspath(p))
+         
+        abs_source      = os.path.abspath(self.sync_source)
+        abs_destination = os.path.abspath(self.sync_destination)
+        
+        job = sync_job(abs_source, abs_destination, abs_job_paths)
         
         return job
     
@@ -266,29 +289,10 @@ class fsevent_sync(object):
 
 class sync_job(object):
         
-    def __init__(self, source, destination):
+    def __init__(self, source, destination, job_paths):
         self.source      = source
         self.destination = destination
-    
-        self.depth = -1
-        
-        self.init_label()
-        self.init_depth()
-        
-    def init_label(self):
-        self.label = hashlib.md5(self.source +
-                                 '|' + 
-                                 self.destination).digest()
-        
-    def init_depth(self):
-        pass
-    
-    
-        
-    
-
-    
-    
+        self.job_paths   = job_paths
     
 class job_runner(object):
     """ Runs the rsync command for the supplied job
@@ -296,42 +300,55 @@ class job_runner(object):
     Execution blocks on the shared lock managed by cwsync
     
     """
-    job_lock = threading.Lock()
     
-    def __init__(self, job_queue):
-        self.job_queue = job_queue
-        logger.debug("Q size %i", self.job_queue.qsize())
+    #job_lock = threading.Lock()
+    
+    def __init__(self, job):
+        self.job = job
+        
     def run(self):
         try:
-            #while 1:
-            # rsync
             
-            logger.debug("Aquiring Lock")
-            #self.job_lock.acquire()
-            #logger.debug("Job lock aquired")
-            
-            logger.debug("Looking for job")
-            job = self.job_queue.get()
-            logger.debug("Job got")
-            logger.debug(job.source)
-            
-
+            logger.debug(self.job.source)
             
             logger.debug("Job started")
-            logger.debug(job.source)
-            #sleep(.5)
+            
+            files_from_file = self.write_rysnc_include_file()
+            self.rsync(files_from_file.name)
+            #logger.debug(files_from_file.read())
+            
+            #
+            
             logger.debug("Job completed")
         except Exception as e:
             logger.debug("Job threw exception")
             logger.debug(e)
         finally:
-            self.job_queue.task_done()
-            logger.debug("Job task done")
-            #self.job_lock.release()
-            #logger.debug("Job lock released")
+            # close and cleanup tmp file
+            files_from_file.close()
 
-            #logger.debug(gc.set_debug(gc.DEBUG_LEAK))
         
+    def write_rysnc_include_file(self):
+        ''' Writes out a file to be passed to the rsync --files-from option.
+        An open file reference is retuned with the pointed set at the start of
+        the file'''
         
+        f = NamedTemporaryFile()
+        logger.debug('self.job.job_paths: %s', self.job.job_paths)
+        for p in self.job.job_paths:
+            rp = string.replace(p, self.job.source, '')
+            
+            if rp == '':
+                rp ='.'
+            
+            f.write(rp+"/\n")
+        
+        f.seek(0)
+        return f
     
+    def rsync(self, include_filename):
+        #rsync -v -dltu --delete  --files-from="/tmp/from" /Users/mkiedrowski/cwsync_test/rsync/source/ /Users/mkiedrowski/cwsync_test/rsync/dest/
+        #call(['rsync', '--delete', '-dltu', self.job.source+'/', self.job.destination+'/'], shell=True)
+        #call(['rsync --delete -rltu --files-from="'+include_filename+'" '+self.job.source+'/ '+self.job.destination+'/'], shell=True)
+        call(['rsync --delete -rltu '+self.job.source+'/ '+self.job.destination+'/'], shell=True)
     
