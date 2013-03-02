@@ -44,6 +44,8 @@ class fsevent_sync(object):
         # Start running
         self.init_job_thread()
         
+    def __del__(self):
+        CFRunLoopStop(self._oberver_runloop_ref)
         
     def init_job_thread(self):
         t = threading.Thread(target=self.job_dispatcher)
