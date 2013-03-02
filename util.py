@@ -2,31 +2,22 @@ __version__ = "1.0"
 
 from FSEvents import *
 from Queue import Queue
-from fsevents import Observer, Stream
-from time import sleep
 import config as CONFIG
 import constant as CONST
 import gc
-import hashlib
 import logging
-import objc
 import os
 import pprint
-import sys
 import string
 import threading
-from tempfile import NamedTemporaryFile 
 from subprocess import call
-#import signal
-
-
 
 logging.basicConfig(format=CONST.LOG_FORMAT)
 
 logger = logging.getLogger('utl')
 logger.setLevel(CONFIG.LOG_LEVEL)
 
-gc.set_debug(gc.DEBUG_STATS | gc.DEBUG_UNCOLLECTABLE)
+#gc.set_debug(gc.DEBUG_STATS | gc.DEBUG_UNCOLLECTABLE)
 
 class fsevent_sync(object):
     
@@ -47,9 +38,10 @@ class fsevent_sync(object):
         # objc values
         self._oberver_runloop_ref = None
         
-        # Start running
+        
         self.sync_status = CONST.STATUS_IDLE
         
+        # Start running
         self.init_job_thread()
         
         
@@ -60,7 +52,10 @@ class fsevent_sync(object):
         self.job_thread = t
     
     def job_dispatcher(self):
-        ''' Waits for signalling from Process the '''
+        ''' Creates and runs sync_jobs as fsevents are reported 
+        
+        '''
+        
         sync_queue = Queue()
         
         while True:
@@ -71,6 +66,7 @@ class fsevent_sync(object):
             if not len(self.event_path_list):
                 # wait for fsevent(s) to come in
                 gc.collect() # maybe not necessary
+                logger.info('Waiting for changes')
                 self.dispatcher_lock.wait()
             
             # create and queue a job for the current list of paths
@@ -96,14 +92,16 @@ class fsevent_sync(object):
                     runner = job_runner(sync_queue.get())
                     t = threading.Thread(target=runner.run)
                     t.daemon = True
+                    logger.info('sync started...')
                     t.start()
                     t.join()
                     del t
                 except Exception as e:
-                    logger.debug('sync job threw exception')
                     logger.debug(e)
+                    logger.info('There were errors during the sync')
                 finally:
                     sync_queue.task_done()
+                    logger.info('sync complete')
     
     def set_sync_source(self, source):
         path = os.path.abspath(source)
@@ -150,7 +148,7 @@ class fsevent_sync(object):
         
         self.start_observing_source()
         
-        self.sync_stats = CONST.STATUS_ACTIVE
+        self.sync_status = CONST.STATUS_ACTIVE
     
     def pause_sync(self):
         # kill rsync command? In separate process?
@@ -172,9 +170,13 @@ class fsevent_sync(object):
         self.sync_status = CONST.STATUS_IDLE
         
     def start_observing_source(self):
-        t = threading.Thread(target=self.init_fsevent_observer)
-        t.daemon = True
-        t.start()
+        
+        if self._oberver_runloop_ref == None:
+            t = threading.Thread(target=self.init_fsevent_observer)
+            t.daemon = True
+            t.start()
+        else:
+            logger.debug('CFRunLoop is running, will not start another')
     
     def stop_observing_source(self):
         
@@ -195,18 +197,6 @@ class fsevent_sync(object):
         '''
         
         pool = NSAutoreleasePool.alloc().init()
-        
-        '''
-        FSEventStreamCreate
-        extern FSEventStreamRef FSEventStreamCreate(
-           CFAllocatorRef allocator,
-           FSEventStreamCallback callback,
-           FSEventStreamContext *context,
-           CFArrayRef pathsToWatch,
-           FSEventStreamEventId sinceWhen,
-           CFTimeInterval latency,
-           FSEventStreamCreateFlags flags);
-        '''
         
         since   = -1
         latency = 4.0
@@ -233,25 +223,26 @@ class fsevent_sync(object):
         self._oberver_runloop_ref = CFRunLoopGetCurrent()
         
         try:
-            logger.debug("Start EVENT LOOP")
             CFRunLoopRun()
-            logger.debug("EVENT LOOP Stopped")
         finally:
             # Clean up stream and event loop
-            logger.debug("EVENT LOOP finally")
             FSEventStreamStop(fsevent_stream)
             FSEventStreamInvalidate(fsevent_stream)
             del pool
+            self._oberver_runloop_ref = None
     
     def process_fsevent(self, stream_ref, client_info, event_count, event_paths, 
                         event_masks, event_ids):
-        logger.debug("Process fs event - \n\
-        client_info: %s, \n\
-        event_count: %s, \n\
-        event_paths: %s, \n\
-        event_masks: %s, \n\
-        event_ids: %s\n", client_info, event_count, event_paths, event_masks, 
-        event_ids)
+        ''' Used as the callback when fsevents are reported.
+        Originally the reported events paths were intended to be used to 
+        optimize the rsync command, however this was unreliable and the 
+        most consistent results were achieved by always calling rsync with the
+        top level source only.
+        
+        The event list is still used processed at the subpath level to aid in 
+        debugging when needed.
+        
+        '''
         
         # lock access to the event list
         self.dispatcher_lock.acquire()
@@ -260,14 +251,10 @@ class fsevent_sync(object):
         for i in range(event_count):
             self.event_path_list.append(event_paths[i])
         
-        # increase the dispatcher semaphore, starts event path processing and 
-        #    job creation
-        logger.debug("fsevent notify dispatcher")
+        # signal to start event path processing and job creation
         self.dispatcher_lock.notify()
-        logger.debug("fsevent release dispatcher")
         self.dispatcher_lock.release()
         
-    
     def create_job(self, job_paths):
         
         abs_job_paths = []
@@ -276,16 +263,24 @@ class fsevent_sync(object):
         for p in job_paths:
             abs_job_paths.append(os.path.abspath(p))
          
-        abs_source      = os.path.abspath(self.sync_source)
-        abs_destination = os.path.abspath(self.sync_destination)
+        _source      = os.path.abspath(self.sync_source)
         
-        job = sync_job(abs_source, abs_destination, abs_job_paths)
+        # if it looks like a local path, get abs
+        if os.path.exists(os.path.abspath(self.sync_destination)):
+            _destination = os.path.abspath(self.sync_destination)
+            logger.debug('Local Job: %s', _destination)
+        elif string.find(self.sync_destination, ':') > 0:
+            _destination = self.sync_destination
+            logger.debug('Remote Job: %s', _destination)
+        else:
+            return
+        
+        job = sync_job(_source, _destination, abs_job_paths)
         
         return job
     
     def delete_job(self):
         pass
-    
 
 class sync_job(object):
         
@@ -301,54 +296,14 @@ class job_runner(object):
     
     """
     
-    #job_lock = threading.Lock()
-    
     def __init__(self, job):
         self.job = job
         
     def run(self):
         try:
-            
-            logger.debug(self.job.source)
-            
-            logger.debug("Job started")
-            
-            files_from_file = self.write_rysnc_include_file()
-            self.rsync(files_from_file.name)
-            #logger.debug(files_from_file.read())
-            
-            #
-            
-            logger.debug("Job completed")
+            logger.debug('start rsync')
+            call(['rsync --delete -rltu '+self.job.source+'/ '+self.job.destination+'/'], shell=True)
+            logger.debug('rsync complete')
         except Exception as e:
-            logger.debug("Job threw exception")
             logger.debug(e)
-        finally:
-            # close and cleanup tmp file
-            files_from_file.close()
-
-        
-    def write_rysnc_include_file(self):
-        ''' Writes out a file to be passed to the rsync --files-from option.
-        An open file reference is retuned with the pointed set at the start of
-        the file'''
-        
-        f = NamedTemporaryFile()
-        logger.debug('self.job.job_paths: %s', self.job.job_paths)
-        for p in self.job.job_paths:
-            rp = string.replace(p, self.job.source, '')
-            
-            if rp == '':
-                rp ='.'
-            
-            f.write(rp+"/\n")
-        
-        f.seek(0)
-        return f
-    
-    def rsync(self, include_filename):
-        #rsync -v -dltu --delete  --files-from="/tmp/from" /Users/mkiedrowski/cwsync_test/rsync/source/ /Users/mkiedrowski/cwsync_test/rsync/dest/
-        #call(['rsync', '--delete', '-dltu', self.job.source+'/', self.job.destination+'/'], shell=True)
-        #call(['rsync --delete -rltu --files-from="'+include_filename+'" '+self.job.source+'/ '+self.job.destination+'/'], shell=True)
-        call(['rsync --delete -rltu '+self.job.source+'/ '+self.job.destination+'/'], shell=True)
     
