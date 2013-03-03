@@ -7,7 +7,6 @@ import constant as CONST
 import gc
 import logging
 import os
-import pprint
 import string
 import threading
 from subprocess import call
@@ -17,12 +16,10 @@ logging.basicConfig(format=CONST.LOG_FORMAT)
 logger = logging.getLogger('utl')
 logger.setLevel(CONFIG.LOG_LEVEL)
 
-#gc.set_debug(gc.DEBUG_STATS | gc.DEBUG_UNCOLLECTABLE)
 
 class fsevent_sync(object):
     
     def __init__(self):
-    
         self.sync_source      = None
         self.sync_destination = None
         
@@ -33,11 +30,11 @@ class fsevent_sync(object):
         
         self.sync_job_lock   = threading.Lock()
         self.dispatcher_lock = threading.Condition()
+        self.fsevent_thread  = None
         self.event_path_list = []
         
         # objc values
         self._oberver_runloop_ref = None
-        
         
         self.sync_status = CONST.STATUS_IDLE
         
@@ -45,7 +42,11 @@ class fsevent_sync(object):
         self.init_job_thread()
         
     def __del__(self):
-        CFRunLoopStop(self._oberver_runloop_ref)
+        try:
+            CFRunLoopStop(self._oberver_runloop_ref)
+            self.fsevent_thread.join(5)
+        except:
+            pass
         
     def init_job_thread(self):
         t = threading.Thread(target=self.job_dispatcher)
@@ -112,15 +113,28 @@ class fsevent_sync(object):
             self.sync_source = path
             logger.debug("sync_source set: %s", self.sync_source)
             return True
+        
         self.sync_source = None
         logger.debug("sync_source NOT set: %s", self.sync_source)
         return False
     
     def set_sync_destination(self, destination):
-        #self.validate_destination(destination)
         #validate to be local path or host:path
-        self.sync_destination = destination
-        return True
+        if self.validate_destination(destination):
+            
+            # if local path use abs path
+            if string.find(destination, ':') < 1:
+                destination = os.path.abspath(destination)
+            else:
+                destination = destination.rstrip('/')
+                
+            self.sync_destination = destination
+            logger.debug("sync_destination set: %s", self.sync_destination)
+            return True
+        
+        self.sync_source = None
+        logger.debug("sync_source NOT set: %s", self.sync_source)
+        return False
     
     def validate_source(self, source):
         if not os.path.isdir(source):
@@ -133,29 +147,43 @@ class fsevent_sync(object):
         
         return True
     
-    def validate_destination(self):
-        # determine if local or ssh path
-        # if local validate dir existence and perms
-        # if remote check for form
+    def validate_destination(self, destination):
+        if os.path.exists(os.path.abspath(destination)):
+            if not os.path.isdir(destination):
+                logger.debug("Local destination is not a directory %s",
+                             destination)
+                return False
+            
+            if not os.access(destination, os.R_OK):
+                logger.debug("Could not read local destination directory %s",
+                         destination)
+                return False
+        
+        elif not string.find(destination, ':') > 1:
+            return False
+        
         return True
+        
+        
     
     def start_sync(self):
         """Create a fsevent observer and start watching the source"""
-        #@todo: self.validate_source(source)
-        #@todo: self.validate_destination(destination)
         
         if self.sync_source == None:
             logger.debug('Could not start sync, sync_source eq None')
             return False
         
-        self.start_observing_source()
+        if self.sync_destination == None:
+            logger.debug('Could not start sync, sync_destination eq None')
+            return False
         
+        self.start_observing_source()
         self.sync_status = CONST.STATUS_ACTIVE
+        
+        return True
     
     def pause_sync(self):
-        # kill rsync command? In separate process?
-        # requeue current rsync command
-        # preserve fs events
+        # preserve fsevents
         # preserve jobs
         logger.debug('pausing')
         
@@ -163,20 +191,12 @@ class fsevent_sync(object):
         self.sync_status = CONST.STATUS_IDLE
         logger.debug('paused')
         
-        
-    def stop_sync(self):
-        # kill rsync command? In separate process?
-        # clear fs events
-        # clear jobs
-        self.stop_observing_source()
-        self.sync_status = CONST.STATUS_IDLE
-        
     def start_observing_source(self):
-        
         if self._oberver_runloop_ref == None:
             t = threading.Thread(target=self.init_fsevent_observer)
             t.daemon = True
             t.start()
+            self.fsevent_thread = t
         else:
             logger.debug('CFRunLoop is running, will not start another')
     
@@ -187,9 +207,12 @@ class fsevent_sync(object):
         if not self._oberver_runloop_ref == None:
             CFRunLoopStop(self._oberver_runloop_ref)
             logger.debug('CFRunLoop stopped')
-            
-        logger.debug('CFRunLoop')
-    
+        
+        try:
+            self.fsevent_thread.join()
+        except:
+            pass
+        
     def init_fsevent_observer(self):
         ''' Instantiate and run an FSEventStream in a CFRunLoop. 
         
@@ -268,21 +291,20 @@ class fsevent_sync(object):
         _source      = os.path.abspath(self.sync_source)
         
         # if it looks like a local path, get abs
+        # either abs or rstrip removes trailing slashes, a single trailing 
+        # slash is appended when the job is run
         if os.path.exists(os.path.abspath(self.sync_destination)):
             _destination = os.path.abspath(self.sync_destination)
             logger.debug('Local Job: %s', _destination)
-        elif string.find(self.sync_destination, ':') > 0:
-            _destination = self.sync_destination
+        elif string.find(self.sync_destination, ':') > 1:
+            _destination = self.sync_destination.rstrip('/')
             logger.debug('Remote Job: %s', _destination)
         else:
-            return
+            return None
         
         job = sync_job(_source, _destination, abs_job_paths)
         
         return job
-    
-    def delete_job(self):
-        pass
 
 class sync_job(object):
         
@@ -304,8 +326,7 @@ class job_runner(object):
     def run(self):
         try:
             logger.debug('start rsync')
-            call(['rsync --delete -rltu '+self.job.source+'/ '+self.job.destination+'/'], shell=True)
+            call([CONST.RSYNC_COMMAND+' '+self.job.source+'/ '+self.job.destination+'/'], shell=True)
             logger.debug('rsync complete')
         except Exception as e:
             logger.debug(e)
-    

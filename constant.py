@@ -3,7 +3,7 @@ STATUS_ACTIVE = 'active'
 STATUS_PAUSED = 'paused'
 
 
-RSYNC_COMMAND = "rsync"
+RSYNC_COMMAND = 'rsync --delete -rltu'
 
 
 # These are a bunch of constants that identify different type of file system
