@@ -92,6 +92,7 @@ class fsevent_sync(object):
             
             # execute all jobs currently in the sync_queue
             # rsync jobs could compete, run one at a time
+            self.sync_job_lock.acquire()
             while sync_queue.qsize() > 0:
                 self.sync_status = CONST.STATUS_SYNC
                 try:
@@ -108,6 +109,7 @@ class fsevent_sync(object):
                     logger.info('There were errors during the sync')
                 finally:
                     sync_queue.task_done()
+                    self.sync_job_lock.release()
                     logger.info('sync complete')
                 
                 self.sync_status = CONST.STATUS_ACTIVE
@@ -170,8 +172,6 @@ class fsevent_sync(object):
             return False
         
         return True
-        
-        
     
     def start_sync(self):
         """Create a fsevent observer and start watching the source"""
@@ -212,6 +212,35 @@ class fsevent_sync(object):
         self.stop_observing_source()
         self.sync_status = CONST.STATUS_IDLE
         logger.debug('paused')
+        return True
+        
+    def reverse_sync(self):
+        ''' Sync destination to source'''
+        if not self.sync_status == CONST.STATUS_IDLE:
+            logger.debug('Could not start reverse sync, sync status not idle')
+            logger.debug(self.sync_status)
+            return False
+        
+        self.sync_job_lock.acquire()
+        try:
+            logger.debug('start rsync')
+            # add config specified options
+            rsync_command = [CONST.RSYNC_COMMAND]
+            rsync_command.extend(CONFIG.RSYNC_OPTIONS)
+            
+            # finish configuration with reversed paths
+            rsync_command.append(self.sync_destination+'/')
+            rsync_command.append(self.sync_source+'/')
+            
+            self.subprocess = Popen(rsync_command, shell=False)
+            # process should block the calling thread
+            self.subprocess.communicate()
+            
+        except Exception as e:
+            logger.debug(e)
+        finally:
+            self.sync_job_lock.release()
+            
         return True
         
     def start_observing_source(self):
