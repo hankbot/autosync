@@ -1,9 +1,10 @@
 STATUS_IDLE   = 'idle'
 STATUS_ACTIVE = 'active'
 STATUS_PAUSED = 'paused'
+STATUS_SYNC = 'sync'
 
 
-RSYNC_COMMAND = 'rsync --delete -rltu'
+RSYNC_COMMAND = 'rsync'
 
 
 # These are a bunch of constants that identify different type of file system

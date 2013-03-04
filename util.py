@@ -7,9 +7,10 @@ import constant as CONST
 import gc
 import logging
 import os
+import signal
 import string
 import threading
-from subprocess import call
+from subprocess import Popen
 
 logging.basicConfig(format=CONST.LOG_FORMAT)
 
@@ -27,6 +28,7 @@ class fsevent_sync(object):
         self.fs_observer = None
         
         self.job_thread = None
+        self.job_runner = None
         
         self.sync_job_lock   = threading.Lock()
         self.dispatcher_lock = threading.Condition()
@@ -69,7 +71,7 @@ class fsevent_sync(object):
             if not len(self.event_path_list):
                 # wait for fsevent(s) to come in
                 gc.collect() # maybe not necessary
-                logger.info('Waiting for changes')
+                logger.info('Ready')
                 self.dispatcher_lock.wait()
             
             # create and queue a job for the current list of paths
@@ -91,11 +93,13 @@ class fsevent_sync(object):
             # execute all jobs currently in the sync_queue
             # rsync jobs could compete, run one at a time
             while sync_queue.qsize() > 0:
+                self.sync_status = CONST.STATUS_SYNC
                 try:
                     runner = job_runner(sync_queue.get())
                     t = threading.Thread(target=runner.run)
                     t.daemon = True
                     logger.info('sync started...')
+                    self.job_runner = runner
                     t.start()
                     t.join()
                     del t
@@ -105,32 +109,35 @@ class fsevent_sync(object):
                 finally:
                     sync_queue.task_done()
                     logger.info('sync complete')
+                
+                self.sync_status = CONST.STATUS_ACTIVE
     
     def set_sync_source(self, source):
-        path = os.path.abspath(source)
-        logger.debug(path)
-        if self.validate_source(source):
-            self.sync_source = path
-            logger.debug("sync_source set: %s", self.sync_source)
-            return True
+        if self.sync_status == CONST.STATUS_IDLE:
+            path = os.path.abspath(source)
+            logger.debug(path)
+            if self.validate_source(source):
+                self.sync_source = path
+                logger.debug("sync_source set: %s", self.sync_source)
+                return True
         
         self.sync_source = None
         logger.debug("sync_source NOT set: %s", self.sync_source)
         return False
     
     def set_sync_destination(self, destination):
-        #validate to be local path or host:path
-        if self.validate_destination(destination):
-            
-            # if local path use abs path
-            if string.find(destination, ':') < 1:
-                destination = os.path.abspath(destination)
-            else:
-                destination = destination.rstrip('/')
-                
-            self.sync_destination = destination
-            logger.debug("sync_destination set: %s", self.sync_destination)
-            return True
+        if self.sync_status == CONST.STATUS_IDLE:
+            #validate to be local path or host:path
+            if self.validate_destination(destination):
+                # if local path use abs path
+                if string.find(destination, ':') < 1:
+                    destination = os.path.abspath(destination)
+                else:
+                    destination = destination.rstrip('/')
+                    
+                self.sync_destination = destination
+                logger.debug("sync_destination set: %s", self.sync_destination)
+                return True
         
         self.sync_source = None
         logger.debug("sync_source NOT set: %s", self.sync_source)
@@ -169,6 +176,11 @@ class fsevent_sync(object):
     def start_sync(self):
         """Create a fsevent observer and start watching the source"""
         
+        if not self.sync_status == CONST.STATUS_IDLE:
+            logger.debug('Could not start sync, sync status not idle')
+            logger.debug(self.sync_status)
+            return False
+        
         if self.sync_source == None:
             logger.debug('Could not start sync, sync_source eq None')
             return False
@@ -182,14 +194,25 @@ class fsevent_sync(object):
         
         return True
     
-    def pause_sync(self):
+    def pause_sync(self, force=False):
         # preserve fsevents
         # preserve jobs
         logger.debug('pausing')
         
+        if force == False and not self.sync_status == CONST.STATUS_ACTIVE:
+            return False
+        
+        # kill rsync if running
+        try:
+            
+            os.kill(self.job_runner.subprocess.pid, signal.SIGTERM)
+        except:
+            pass
+        
         self.stop_observing_source()
         self.sync_status = CONST.STATUS_IDLE
         logger.debug('paused')
+        return True
         
     def start_observing_source(self):
         if self._oberver_runloop_ref == None:
@@ -223,9 +246,9 @@ class fsevent_sync(object):
         
         pool = NSAutoreleasePool.alloc().init()
         
-        since   = -1
-        latency = 4.0
-        flags   = 0
+        since   = CONFIG.FSEVENT_SINCE
+        latency = CONFIG.FSEVENT_LATENCY
+        flags   = kFSEventStreamCreateFlagNoDefer
         
         fsevent_stream = FSEventStreamCreate(kCFAllocatorDefault, 
                                               self.process_fsevent,
@@ -290,8 +313,8 @@ class fsevent_sync(object):
          
         _source      = os.path.abspath(self.sync_source)
         
-        # if it looks like a local path, get abs
-        # either abs or rstrip removes trailing slashes, a single trailing 
+        # if destination looks like a local path, get abs
+        # Both abs and rstrip remove trailing slashes, a single trailing 
         # slash is appended when the job is run
         if os.path.exists(os.path.abspath(self.sync_destination)):
             _destination = os.path.abspath(self.sync_destination)
@@ -307,7 +330,6 @@ class fsevent_sync(object):
         return job
 
 class sync_job(object):
-        
     def __init__(self, source, destination, job_paths):
         self.source      = source
         self.destination = destination
@@ -322,11 +344,21 @@ class job_runner(object):
     
     def __init__(self, job):
         self.job = job
-        
+        self.subprocess = None
     def run(self):
         try:
             logger.debug('start rsync')
-            call([CONST.RSYNC_COMMAND+' '+self.job.source+'/ '+self.job.destination+'/'], shell=True)
-            logger.debug('rsync complete')
+            # add config specified options
+            rsync_command = [CONST.RSYNC_COMMAND]
+            rsync_command.extend(CONFIG.RSYNC_OPTIONS)
+            
+            # finish configuration with paths
+            rsync_command.append(self.job.source+'/')
+            rsync_command.append(self.job.destination+'/')
+            
+            self.subprocess = Popen(rsync_command, shell=False)
+            # process should block the calling thread
+            self.subprocess.communicate()
+            
         except Exception as e:
             logger.debug(e)
